@@ -1879,7 +1879,18 @@ static int riscv_run_algorithm(struct target *target, int num_mem_params,
 		struct reg_param *reg_params, target_addr_t entry_point,
 		target_addr_t exit_point, int timeout_ms, void *arch_info)
 {
-	RISCV_INFO(info);
+	enum gdb_regno regnums[] = {
+		GDB_REGNO_RA, GDB_REGNO_SP, GDB_REGNO_GP, GDB_REGNO_TP,
+		GDB_REGNO_T0, GDB_REGNO_T1, GDB_REGNO_T2, GDB_REGNO_FP,
+		GDB_REGNO_S1, GDB_REGNO_A0, GDB_REGNO_A1, GDB_REGNO_A2,
+		GDB_REGNO_A3, GDB_REGNO_A4, GDB_REGNO_A5, GDB_REGNO_A6,
+		GDB_REGNO_A7, GDB_REGNO_S2, GDB_REGNO_S3, GDB_REGNO_S4,
+		GDB_REGNO_S5, GDB_REGNO_S6, GDB_REGNO_S7, GDB_REGNO_S8,
+		GDB_REGNO_S9, GDB_REGNO_S10, GDB_REGNO_S11, GDB_REGNO_T3,
+		GDB_REGNO_T4, GDB_REGNO_T5, GDB_REGNO_T6,
+		GDB_REGNO_PC,
+		GDB_REGNO_MSTATUS, GDB_REGNO_MEPC, GDB_REGNO_MCAUSE,
+	};
 
 	if (num_mem_params > 0) {
 		LOG_ERROR("Memory parameters are not supported for RISC-V algorithms.");
@@ -1895,10 +1906,17 @@ static int riscv_run_algorithm(struct target *target, int num_mem_params,
 	struct reg *reg_pc = register_get_by_name(target->reg_cache, "pc", true);
 	if (!reg_pc || reg_pc->type->get(reg_pc) != ERROR_OK)
 		return ERROR_FAIL;
-	uint64_t saved_pc = buf_get_u64(reg_pc->value, 0, reg_pc->size);
-	LOG_DEBUG("saved_pc=0x%" PRIx64, saved_pc);
 
-	uint64_t saved_regs[32];
+	uint64_t saved_regs[ARRAY_SIZE(regnums)];
+	for (unsigned i = 0; i < ARRAY_SIZE(regnums); i++) {
+		enum gdb_regno regno = regnums[i];
+		LOG_DEBUG("save %s", gdb_regno_name(regno));
+		if (riscv_get_register(target, &saved_regs[i], regno) != ERROR_OK) {
+			LOG_ERROR("get(%s) failed", gdb_regno_name(regno));
+			return ERROR_FAIL;
+		}
+	}
+
 	for (int i = 0; i < num_reg_params; i++) {
 		LOG_DEBUG("save %s", reg_params[i].reg_name);
 		struct reg *r = register_get_by_name(target->reg_cache, reg_params[i].reg_name, false);
@@ -1917,10 +1935,6 @@ static int riscv_run_algorithm(struct target *target, int num_mem_params,
 			LOG_ERROR("Only GPRs can be use as argument registers.");
 			return ERROR_FAIL;
 		}
-
-		if (r->type->get(r) != ERROR_OK)
-			return ERROR_FAIL;
-		saved_regs[r->number] = buf_get_u64(r->value, 0, r->size);
 
 		if (reg_params[i].direction == PARAM_OUT || reg_params[i].direction == PARAM_IN_OUT) {
 			if (r->type->set(r, reg_params[i].value) != ERROR_OK)
@@ -1947,18 +1961,7 @@ static int riscv_run_algorithm(struct target *target, int num_mem_params,
 			LOG_ERROR("Algorithm timed out after %" PRId64 " ms.", now - start);
 			riscv_halt(target);
 			old_or_new_riscv_poll(target);
-			enum gdb_regno regnums[] = {
-				GDB_REGNO_RA, GDB_REGNO_SP, GDB_REGNO_GP, GDB_REGNO_TP,
-				GDB_REGNO_T0, GDB_REGNO_T1, GDB_REGNO_T2, GDB_REGNO_FP,
-				GDB_REGNO_S1, GDB_REGNO_A0, GDB_REGNO_A1, GDB_REGNO_A2,
-				GDB_REGNO_A3, GDB_REGNO_A4, GDB_REGNO_A5, GDB_REGNO_A6,
-				GDB_REGNO_A7, GDB_REGNO_S2, GDB_REGNO_S3, GDB_REGNO_S4,
-				GDB_REGNO_S5, GDB_REGNO_S6, GDB_REGNO_S7, GDB_REGNO_S8,
-				GDB_REGNO_S9, GDB_REGNO_S10, GDB_REGNO_S11, GDB_REGNO_T3,
-				GDB_REGNO_T4, GDB_REGNO_T5, GDB_REGNO_T6,
-				GDB_REGNO_PC,
-				GDB_REGNO_MSTATUS, GDB_REGNO_MEPC, GDB_REGNO_MCAUSE,
-			};
+
 			for (unsigned i = 0; i < ARRAY_SIZE(regnums); i++) {
 				enum gdb_regno regno = regnums[i];
 				riscv_reg_t reg_value;
@@ -1991,12 +1994,7 @@ static int riscv_run_algorithm(struct target *target, int num_mem_params,
 	if (riscv_interrupts_restore(target, current_mstatus) != ERROR_OK)
 		return ERROR_FAIL;
 
-	/* Restore registers */
-	uint8_t buf[8] = { 0 };
-	buf_set_u64(buf, 0, info->xlen, saved_pc);
-	if (reg_pc->type->set(reg_pc, buf) != ERROR_OK)
-		return ERROR_FAIL;
-
+	/* Return Results */
 	for (int i = 0; i < num_reg_params; i++) {
 		if (reg_params[i].direction == PARAM_IN ||
 				reg_params[i].direction == PARAM_IN_OUT) {
@@ -2007,11 +2005,14 @@ static int riscv_run_algorithm(struct target *target, int num_mem_params,
 			}
 			buf_cpy(r->value, reg_params[i].value, reg_params[i].size);
 		}
-		LOG_DEBUG("restore %s", reg_params[i].reg_name);
-		struct reg *r = register_get_by_name(target->reg_cache, reg_params[i].reg_name, false);
-		buf_set_u64(buf, 0, info->xlen, saved_regs[r->number]);
-		if (r->type->set(r, buf) != ERROR_OK) {
-			LOG_ERROR("set(%s) failed", r->name);
+	}
+
+	/* Restore registers */
+	for (unsigned i = 0; i < ARRAY_SIZE(regnums); i++) {
+		enum gdb_regno regno = regnums[i];
+		LOG_DEBUG("restore %s", gdb_regno_name(regno));
+		if (riscv_set_register(target, regno, saved_regs[i]) != ERROR_OK) {
+			LOG_ERROR("set(%s) failed", gdb_regno_name(regno));
 			return ERROR_FAIL;
 		}
 	}
